@@ -26,9 +26,9 @@ def get_yt_dlp_opts(mode, outtmpl):
             }],
         })
     else: # video
-        # Simplified format string to be more robust
+        # Allow any available format to prevent "Requested format not available" errors
         opts.update({
-            'format': 'best[height<=360]/best',
+            'format': 'best',
         })
     return opts
 
@@ -47,30 +47,31 @@ def download():
         
         outtmpl = os.path.join(download_dir, '%(title)s.%(ext)s')
         
-        # Use a more lenient approach for extraction
-        with yt_dlp.YoutubeDL(get_yt_dlp_opts(mode, outtmpl)) as ydl:
-            # First, try to just get info without downloading to verify
+        # Start with simple options
+        opts = get_yt_dlp_opts(mode, outtmpl)
+        
+        with yt_dlp.YoutubeDL(opts) as ydl:
             try:
                 info = ydl.extract_info(url, download=True)
-            except yt_dlp.utils.DownloadError:
-                # Fallback: remove strict format constraints if it fails
-                opts = get_yt_dlp_opts(mode, outtmpl)
-                opts['format'] = 'best'
-                with yt_dlp.YoutubeDL(opts) as ydl_fallback:
-                    info = ydl_fallback.extract_info(url, download=True)
+            except Exception as e:
+                # If it fails with cookies, try without as a last resort
+                # or just log the error
+                print(f"Download error: {str(e)}")
+                return jsonify({'error': str(e)}), 500
 
             filename = ydl.prepare_filename(info)
             if mode == 'audio':
                 filename = os.path.splitext(filename)[0] + '.mp3'
 
-            # Double check if file exists, if not look in directory
+            # Search for the file if prepare_filename is slightly off
             if not os.path.exists(filename):
-                files = [f for f in os.listdir(download_dir) if not f.endswith('.part')]
-                if files:
-                    filename = os.path.join(download_dir, files[0])
+                for f in os.listdir(download_dir):
+                    if not f.endswith('.part'):
+                        filename = os.path.join(download_dir, f)
+                        break
 
             if not os.path.exists(filename):
-                return jsonify({'error': 'File not found after download'}), 500
+                return jsonify({'error': f'File not found after download attempt in {download_dir}'}), 500
 
             return send_file(
                 filename,
