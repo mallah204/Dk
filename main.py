@@ -6,11 +6,16 @@ import shutil
 
 app = Flask(__name__)
 
-# Use absolute path for cookies
+# Use absolute path for cookies if available
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 COOKIES_FILE = os.path.join(BASE_DIR, 'cookies', 'youtube.txt')
 
 def get_yt_dlp_opts(mode, outtmpl):
+    # Selector for video: best 360p or worst available
+    video_selector = 'best[height<=360]/worst'
+    # Selector for audio: worst audio or best available
+    audio_selector = 'worstaudio/best'
+    
     opts = {
         'cookiefile': COOKIES_FILE if os.path.exists(COOKIES_FILE) else None,
         'quiet': True,
@@ -20,8 +25,7 @@ def get_yt_dlp_opts(mode, outtmpl):
             'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
         ],
         'nocheckcertificate': True,
-        # Use simple format strings that are more likely to exist
-        'format': 'bestaudio/best' if mode == 'audio' else 'best/bestvideo+bestaudio',
+        'format': audio_selector if mode == 'audio' else video_selector,
     }
     
     if mode == 'audio':
@@ -29,7 +33,7 @@ def get_yt_dlp_opts(mode, outtmpl):
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': 'mp3',
-                'preferredquality': '128', # Reduced quality slightly for better compatibility
+                'preferredquality': '64', # low bitrate as requested
             }],
         })
     else:
@@ -39,79 +43,67 @@ def get_yt_dlp_opts(mode, outtmpl):
         
     return opts
 
-@app.route('/download', methods=['GET'])
-def download():
+@app.route('/video', methods=['GET'])
+def download_video():
     url = request.args.get('url')
-    mode = request.args.get('mode', 'video')
-    
     if not url:
         return jsonify({'error': 'URL is required'}), 400
+    return process_download(url, 'video')
 
-    # Clean the URL (remove tracking params which sometimes mess up yt-dlp)
-    if '?' in url and 'watch' not in url:
-        url = url.split('?')[0]
+@app.route('/audio', methods=['GET'])
+def download_audio():
+    url = request.args.get('url')
+    if not url:
+        return jsonify({'error': 'URL is required'}), 400
+    return process_download(url, 'audio')
 
+def process_download(url, mode):
     download_dir = tempfile.mkdtemp()
-    
     try:
         outtmpl = os.path.join(download_dir, '%(title)s.%(ext)s')
         opts = get_yt_dlp_opts(mode, outtmpl)
         
         with yt_dlp.YoutubeDL(opts) as ydl:
             try:
-                # Main attempt
                 info = ydl.extract_info(url, download=True)
-            except Exception as e:
-                # Absolute fallback: just download anything
-                opts['format'] = 'best'
-                if 'postprocessors' in opts and mode != 'audio':
-                    del opts['postprocessors']
-                if 'merge_output_format' in opts:
-                    del opts['merge_output_format']
+                filename = ydl.prepare_filename(info)
                 
-                with yt_dlp.YoutubeDL(opts) as ydl_fallback:
-                    info = ydl_fallback.extract_info(url, download=True)
-            
-            filename = ydl.prepare_filename(info)
-            
-            # Extension cleanup for post-processed files
-            if mode == 'audio':
-                base, _ = os.path.splitext(filename)
-                if os.path.exists(base + '.mp3'):
-                    filename = base + '.mp3'
-            elif mode == 'video':
-                base, _ = os.path.splitext(filename)
-                if os.path.exists(base + '.mp4'):
-                    filename = base + '.mp4'
+                # Handle extension changes after post-processing
+                if mode == 'audio':
+                    base, _ = os.path.splitext(filename)
+                    if os.path.exists(base + '.mp3'):
+                        filename = base + '.mp3'
+                elif mode == 'video':
+                    base, _ = os.path.splitext(filename)
+                    if os.path.exists(base + '.mp4'):
+                        filename = base + '.mp4'
+                
+                if not os.path.exists(filename):
+                    # Fallback scan for any file in the directory
+                    files = [f for f in os.listdir(download_dir) if not f.endswith('.part')]
+                    if files:
+                        filename = os.path.join(download_dir, files[0])
+                    else:
+                        raise Exception("No file generated")
 
-        if not os.path.exists(filename):
-            # Final scan
-            files = [f for f in os.listdir(download_dir) if not f.endswith('.part')]
-            if files:
-                filename = os.path.join(download_dir, files[0])
-            else:
-                return jsonify({'error': 'Download failed to produce a file'}), 500
-
-        return send_file(
-            filename,
-            as_attachment=True,
-            download_name=os.path.basename(filename)
-        )
+                return send_file(
+                    filename,
+                    as_attachment=True,
+                    download_name=os.path.basename(filename)
+                )
+            except Exception as e:
+                return jsonify({'error': f"yt-dlp error: {str(e)}"}), 500
     except Exception as e:
-        # If even fallback fails, we return the specific error but without the ANSI codes
-        error_msg = str(e).replace('\u001b[0;31m', '').replace('\u001b[0m', '')
-        return jsonify({'error': f"Download Error: {error_msg}"}), 500
-    finally:
-        # Background cleanup or periodic cleanup is better, but here we keep it simple
-        pass
+        return jsonify({'error': f"Server error: {str(e)}"}), 500
+    # Note: Cleanup would ideally happen after send_file, but for simplicity we skip it in this endpoint
 
 @app.route('/', methods=['GET'])
 def index():
     return jsonify({
         'status': 'online',
-        'usage': {
-            'video': '/download?url=YOUR_URL&mode=video',
-            'audio': '/download?url=YOUR_URL&mode=audio'
+        'endpoints': {
+            'video': '/video?url=<url>',
+            'audio': '/audio?url=<url>'
         }
     })
 
