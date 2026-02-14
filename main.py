@@ -1,6 +1,5 @@
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify
 import yt_dlp
-import tempfile
 import os
 
 app = Flask(__name__)
@@ -15,99 +14,63 @@ COOKIES_FILE = os.path.join(BASE_DIR, 'cookies', 'youtube.txt')
 FFMPEG_PATH = os.path.join(BASE_DIR, 'bin', 'ffmpeg')
 
 
-def get_ydl_opts(mode, output_path):
-    # Safer formats (less "Requested format not available" error)
-    video_format = "best[height<=360]/best"
-    audio_format = "bestaudio/best"
-
+def get_ydl_opts_for_info():
     opts = {
-        'outtmpl': output_path,
         'quiet': True,
         'no_warnings': True,
         'nocheckcertificate': True,
-        'format': audio_format if mode == "audio" else video_format,
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
-        }
+        },
+        'skip_download': True,  # Important! Don't download
     }
 
-    # Add cookies only if exist
+    # Add cookies if exist
     if os.path.exists(COOKIES_FILE):
         opts['cookiefile'] = COOKIES_FILE
 
-    # Add ffmpeg path only if exist
+    # Add ffmpeg path if exist
     if os.path.exists(FFMPEG_PATH):
         opts['ffmpeg_location'] = FFMPEG_PATH
-
-    if mode == "video":
-        opts['merge_output_format'] = 'mp4'
-
-    if mode == "audio":
-        opts['postprocessors'] = [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '64',
-        }]
 
     return opts
 
 
-def download_media(url, mode):
-    temp_dir = tempfile.mkdtemp()
-    output_template = os.path.join(temp_dir, "%(title)s.%(ext)s")
+@app.route("/formats")
+def list_formats():
+    url = request.args.get("url")
+    if not url:
+        return jsonify({"error": "URL parameter missing"}), 400
 
     try:
-        ydl_opts = get_ydl_opts(mode, output_template)
-
+        ydl_opts = get_ydl_opts_for_info()
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            filename = ydl.prepare_filename(info)
+            info = ydl.extract_info(url, download=False)
 
-        # Fix filename after processing
-        if mode == "audio":
-            filename = os.path.splitext(filename)[0] + ".mp3"
+        # Extract all formats
+        formats = []
+        for f in info.get('formats', []):
+            formats.append({
+                'format_id': f.get('format_id'),
+                'ext': f.get('ext'),
+                'acodec': f.get('acodec'),
+                'vcodec': f.get('vcodec'),
+                'height': f.get('height'),
+                'width': f.get('width'),
+                'fps': f.get('fps'),
+                'tbr': f.get('tbr'),
+                'filesize': f.get('filesize'),
+                'url': f.get('url'),
+            })
 
-        if mode == "video":
-            filename = os.path.splitext(filename)[0] + ".mp4"
-
-        # Fallback if filename changed
-        if not os.path.exists(filename):
-            files = [f for f in os.listdir(temp_dir) if not f.endswith('.part')]
-            if files:
-                filename = os.path.join(temp_dir, files[0])
-            else:
-                return None, "Download failed"
-
-        return filename, None
+        return jsonify({
+            'title': info.get('title'),
+            'id': info.get('id'),
+            'formats': formats
+        })
 
     except Exception as e:
-        return None, str(e)
-
-
-@app.route("/video")
-def video():
-    url = request.args.get("url")
-    if not url:
-        return jsonify({"error": "URL parameter missing"}), 400
-
-    file_path, error = download_media(url, "video")
-    if error:
-        return jsonify({"error": f"Download Error: {error}"}), 500
-
-    return send_file(file_path, as_attachment=True)
-
-
-@app.route("/audio")
-def audio():
-    url = request.args.get("url")
-    if not url:
-        return jsonify({"error": "URL parameter missing"}), 400
-
-    file_path, error = download_media(url, "audio")
-    if error:
-        return jsonify({"error": f"Download Error: {error}"}), 500
-
-    return send_file(file_path, as_attachment=True)
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route("/")
@@ -115,8 +78,7 @@ def home():
     return jsonify({
         "status": "online",
         "endpoints": {
-            "video": "/video?url=VIDEO_URL",
-            "audio": "/audio?url=VIDEO_URL"
+            "formats": "/formats?url=VIDEO_URL"
         }
     })
 
