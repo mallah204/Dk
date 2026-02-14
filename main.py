@@ -32,7 +32,8 @@ def get_yt_dlp_opts(mode, outtmpl):
         })
     else: # video
         opts.update({
-            'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+            'format': 'bestvideo+bestaudio/best',
+            'merge_output_format': 'mp4',
         })
     return opts
 
@@ -51,6 +52,9 @@ def download():
         opts = get_yt_dlp_opts(mode, outtmpl)
         
         with yt_dlp.YoutubeDL(opts) as ydl:
+            # First extract info without downloading to handle potential errors
+            info = ydl.extract_info(url, download=False)
+            # Re-fetch info and download
             info = ydl.extract_info(url, download=True)
             filename = ydl.prepare_filename(info)
             
