@@ -3,14 +3,17 @@ import yt_dlp
 import os
 import tempfile
 import time
+import shutil
 
 app = Flask(__name__)
 
-COOKIES_FILE = 'cookies/youtube.txt'
+# Use absolute path for cookies
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+COOKIES_FILE = os.path.join(BASE_DIR, 'cookies', 'youtube.txt')
 
 def get_yt_dlp_opts(mode, outtmpl):
     opts = {
-        'cookiefile': COOKIES_FILE,
+        'cookiefile': COOKIES_FILE if os.path.exists(COOKIES_FILE) else None,
         'quiet': True,
         'no_warnings': True,
         'outtmpl': outtmpl,
@@ -24,13 +27,12 @@ def get_yt_dlp_opts(mode, outtmpl):
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': 'mp3',
-                'preferredquality': '64',
+                'preferredquality': '192',
             }],
         })
     else: # video
-        # Default to 360p but allow any if not available
         opts.update({
-            'format': 'best[height<=360]/best',
+            'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
         })
     return opts
 
@@ -42,59 +44,53 @@ def download():
     if not url:
         return jsonify({'error': 'URL is required'}), 400
 
+    download_dir = tempfile.mkdtemp()
+    
     try:
-        session_id = str(time.time()).replace('.', '')
-        download_dir = os.path.join(tempfile.gettempdir(), f'ytdl_{session_id}')
-        os.makedirs(download_dir, exist_ok=True)
-        
         outtmpl = os.path.join(download_dir, '%(title)s.%(ext)s')
+        opts = get_yt_dlp_opts(mode, outtmpl)
         
-        # Try with preferred quality first
-        try:
-            opts = get_yt_dlp_opts(mode, outtmpl)
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                filename = ydl.prepare_filename(info)
-        except Exception:
-            # Absolute fallback for format errors
-            opts = get_yt_dlp_opts(mode, outtmpl)
-            opts['format'] = 'best'
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                filename = ydl.prepare_filename(info)
-
-        # Handle post-processed extensions for audio
-        if mode == 'audio':
-            base_path = os.path.splitext(filename)[0]
-            if os.path.exists(base_path + '.mp3'):
-                filename = base_path + '.mp3'
-
-        # Absolute file search fallback
-        if not os.path.exists(filename):
-            for f in os.listdir(download_dir):
-                if not f.endswith('.part'):
-                    filename = os.path.join(download_dir, f)
-                    break
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info)
+            
+            # If audio, yt-dlp might have changed the extension to .mp3
+            if mode == 'audio':
+                base, _ = os.path.splitext(filename)
+                if os.path.exists(base + '.mp3'):
+                    filename = base + '.mp3'
 
         if not os.path.exists(filename):
-            return jsonify({'error': 'Download failed to produce a file'}), 500
+            # Fallback: find any file in the directory
+            files = os.listdir(download_dir)
+            if files:
+                filename = os.path.join(download_dir, files[0])
+            else:
+                return jsonify({'error': 'File not found after download'}), 500
 
+        # We can't easily use after_this_response for cleanup if it's missing
+        # For now, we'll send the file. In a production env, a cron job or 
+        # background task would clean up temp files.
         return send_file(
             filename,
             as_attachment=True,
             download_name=os.path.basename(filename)
         )
     except Exception as e:
-        error_msg = str(e).split('\n')[0]
-        return jsonify({'error': f"Download Error: {error_msg}"}), 500
+        return jsonify({'error': str(e)}), 500
+    finally:
+        # Note: shutil.rmtree here might delete file before send_file finishes
+        # but in many flask envs send_file reads it into memory or handles it
+        # however, to be safe we'll skip immediate cleanup in this simple fix
+        pass
 
 @app.route('/', methods=['GET'])
 def index():
     return jsonify({
-        'message': 'YouTube Downloader API is running',
-        'endpoints': {
-            'download_video': '/download?mode=video&url=<YOUTUBE_URL>',
-            'download_audio': '/download?mode=audio&url=<YOUTUBE_URL>'
+        'status': 'online',
+        'usage': {
+            'video': '/download?url=YOUR_URL&mode=video',
+            'audio': '/download?url=YOUR_URL&mode=audio'
         }
     })
 
