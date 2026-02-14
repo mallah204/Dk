@@ -11,22 +11,19 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 COOKIES_FILE = os.path.join(BASE_DIR, 'cookies', 'youtube.txt')
 
 def get_yt_dlp_opts(mode, outtmpl):
-    # Selector for video: best 360p or worst available
-    video_selector = 'best[height<=360]/worst'
-    # Selector for audio: worst audio or best available
-    audio_selector = 'worstaudio/best'
+    video_selector = 'bestvideo[height<=360]+bestaudio/best[height<=360]/bestvideo+bestaudio/best'
+    audio_selector = 'bestaudio/best'
     
     opts = {
         'cookiefile': COOKIES_FILE if os.path.exists(COOKIES_FILE) else None,
         'quiet': True,
         'no_warnings': True,
         'outtmpl': outtmpl,
-        'add_header': [
-            'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
-        ],
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
+        },
         'nocheckcertificate': True,
         'format': audio_selector if mode == 'audio' else video_selector,
-        'ignoreerrors': True, # Crucial: don't stop on single format errors
     }
     
     if mode == 'audio':
@@ -67,22 +64,23 @@ def process_download(url, mode):
         info = None
         filename = None
         
-        # We try to extract info and download
-        with yt_dlp.YoutubeDL(opts) as ydl:
+        format_fallbacks = [
+            opts['format'],
+            'best',
+            'worst',
+        ]
+        
+        for fmt in format_fallbacks:
             try:
-                # Attempt with the preferred format selector
-                info = ydl.extract_info(url, download=True)
-                if not info or '_type' in info and info['_type'] == 'playlist':
-                    raise Exception("Format selection failed or playlist returned")
-                filename = ydl.prepare_filename(info)
+                opts['format'] = fmt
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    if info and not ('_type' in info and info['_type'] == 'playlist'):
+                        filename = ydl.prepare_filename(info)
+                        break
             except Exception as e:
-                # FALLBACK: Try with absolute 'best' format if the specific selector fails
-                print(f"Preferred format failed: {e}. Trying fallback 'best' format.")
-                opts['format'] = 'best'
-                # Re-initialize to clear any cached failure states
-                with yt_dlp.YoutubeDL(opts) as ydl_fallback:
-                    info = ydl_fallback.extract_info(url, download=True)
-                    filename = ydl_fallback.prepare_filename(info)
+                print(f"Format '{fmt}' failed: {e}")
+                continue
 
         if not info:
              return jsonify({'error': 'Download failed: Requested format and fallbacks are not available.'}), 500
