@@ -12,10 +12,9 @@ COOKIES_FILE = os.path.join(BASE_DIR, 'cookies', 'youtube.txt')
 
 def get_yt_dlp_opts(mode, outtmpl):
     # Selector for video: best 360p or worst available
-    # Using 'bestvideo[height<=360]+bestaudio/best[height<=360]/best' to ensure fallback
-    video_selector = 'best[height<=360]/bestvideo[height<=360]+bestaudio/best'
-    # Selector for audio: worstaudio or best available
-    audio_selector = 'worstaudio/bestaudio/best'
+    video_selector = 'best[height<=360]/worst'
+    # Selector for audio: worst audio or best available
+    audio_selector = 'worstaudio/best'
     
     opts = {
         'cookiefile': COOKIES_FILE if os.path.exists(COOKIES_FILE) else None,
@@ -27,7 +26,6 @@ def get_yt_dlp_opts(mode, outtmpl):
         ],
         'nocheckcertificate': True,
         'format': audio_selector if mode == 'audio' else video_selector,
-        'ignoreerrors': True, # Continue on download errors
     }
     
     if mode == 'audio':
@@ -35,7 +33,7 @@ def get_yt_dlp_opts(mode, outtmpl):
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': 'mp3',
-                'preferredquality': '64', # low bitrate as requested
+                'preferredquality': '64',
             }],
         })
     else:
@@ -65,53 +63,63 @@ def process_download(url, mode):
         outtmpl = os.path.join(download_dir, '%(title)s.%(ext)s')
         opts = get_yt_dlp_opts(mode, outtmpl)
         
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            try:
-                # Extract info and download
+        info = None
+        filename = None
+        
+        # Try with selectors first
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=True)
-                if not info:
-                    # Retry with absolute simplest format if selector failed
-                    opts['format'] = 'best'
-                    info = ydl.extract_info(url, download=True)
-                
-                if not info:
-                     return jsonify({'error': 'Could not extract video info'}), 500
-
                 filename = ydl.prepare_filename(info)
-                
-                # Handle extension changes after post-processing
-                if mode == 'audio':
-                    base, _ = os.path.splitext(filename)
-                    if os.path.exists(base + '.mp3'):
-                        filename = base + '.mp3'
-                    elif not os.path.exists(filename):
-                        # Look for any mp3 in the temp dir
-                        for f in os.listdir(download_dir):
-                            if f.endswith('.mp3'):
-                                filename = os.path.join(download_dir, f)
-                                break
-                elif mode == 'video':
-                    base, _ = os.path.splitext(filename)
-                    if os.path.exists(base + '.mp4'):
-                        filename = base + '.mp4'
-                
-                if not os.path.exists(filename):
-                    # Fallback scan for any file in the directory
-                    files = [f for f in os.listdir(download_dir) if not f.endswith('.part')]
-                    if files:
-                        filename = os.path.join(download_dir, files[0])
-                    else:
-                        return jsonify({'error': 'Download failed to produce a file'}), 500
+        except Exception:
+            # Fallback to absolute simplest format if selectors failed
+            opts['format'] = 'best'
+            if mode == 'video' and 'postprocessors' in opts:
+                opts['postprocessors'] = []
+            
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                filename = ydl.prepare_filename(info)
 
-                return send_file(
-                    filename,
-                    as_attachment=True,
-                    download_name=os.path.basename(filename)
-                )
-            except Exception as e:
-                return jsonify({'error': f"yt-dlp error: {str(e)}"}), 500
+        if not info:
+             return jsonify({'error': 'Download failed to extract info'}), 500
+
+        # Handle post-processing extension changes
+        if mode == 'audio':
+            base, _ = os.path.splitext(filename)
+            if os.path.exists(base + '.mp3'):
+                filename = base + '.mp3'
+            else:
+                for f in os.listdir(download_dir):
+                    if f.endswith('.mp3'):
+                        filename = os.path.join(download_dir, f)
+                        break
+        elif mode == 'video':
+            base, _ = os.path.splitext(filename)
+            if os.path.exists(base + '.mp4'):
+                filename = base + '.mp4'
+        
+        if not os.path.exists(filename):
+            files = [f for f in os.listdir(download_dir) if not f.endswith('.part')]
+            if files:
+                filename = os.path.join(download_dir, files[0])
+            else:
+                return jsonify({'error': 'No file was produced by yt-dlp'}), 500
+
+        # Create a persistent copy because temp directories are often cleared
+        final_dest = os.path.join(tempfile.gettempdir(), os.path.basename(filename))
+        shutil.copy2(filename, final_dest)
+        shutil.rmtree(download_dir)
+
+        return send_file(
+            final_dest,
+            as_attachment=True,
+            download_name=os.path.basename(filename)
+        )
     except Exception as e:
-        return jsonify({'error': f"Server error: {str(e)}"}), 500
+        if os.path.exists(download_dir):
+            shutil.rmtree(download_dir)
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/', methods=['GET'])
 def index():
