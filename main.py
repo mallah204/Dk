@@ -32,6 +32,7 @@ def get_yt_dlp_opts(mode, outtmpl):
         })
     else: # video
         opts.update({
+            # Resilient format selection
             'format': 'bestvideo+bestaudio/best',
             'merge_output_format': 'mp4',
         })
@@ -52,29 +53,38 @@ def download():
         opts = get_yt_dlp_opts(mode, outtmpl)
         
         with yt_dlp.YoutubeDL(opts) as ydl:
-            # First extract info without downloading to handle potential errors
-            info = ydl.extract_info(url, download=False)
-            # Re-fetch info and download
-            info = ydl.extract_info(url, download=True)
+            # Re-fetch info and download with broad error handling
+            try:
+                info = ydl.extract_info(url, download=True)
+            except Exception as e:
+                # Fallback to absolute best if combined fails
+                if mode == 'video':
+                    opts['format'] = 'best'
+                    with yt_dlp.YoutubeDL(opts) as ydl_fallback:
+                        info = ydl_fallback.extract_info(url, download=True)
+                else:
+                    raise e
+            
             filename = ydl.prepare_filename(info)
             
-            # If audio, yt-dlp might have changed the extension to .mp3
+            # Handle extension changes
             if mode == 'audio':
                 base, _ = os.path.splitext(filename)
                 if os.path.exists(base + '.mp3'):
                     filename = base + '.mp3'
+            elif mode == 'video':
+                # If we merged to mp4, ensure filename reflects that
+                base, _ = os.path.splitext(filename)
+                if os.path.exists(base + '.mp4'):
+                    filename = base + '.mp4'
 
         if not os.path.exists(filename):
-            # Fallback: find any file in the directory
-            files = os.listdir(download_dir)
+            files = [f for f in os.listdir(download_dir) if not f.endswith('.part')]
             if files:
                 filename = os.path.join(download_dir, files[0])
             else:
                 return jsonify({'error': 'File not found after download'}), 500
 
-        # We can't easily use after_this_response for cleanup if it's missing
-        # For now, we'll send the file. In a production env, a cron job or 
-        # background task would clean up temp files.
         return send_file(
             filename,
             as_attachment=True,
@@ -82,11 +92,6 @@ def download():
         )
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-    finally:
-        # Note: shutil.rmtree here might delete file before send_file finishes
-        # but in many flask envs send_file reads it into memory or handles it
-        # however, to be safe we'll skip immediate cleanup in this simple fix
-        pass
 
 @app.route('/', methods=['GET'])
 def index():
