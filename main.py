@@ -2,7 +2,6 @@ from flask import Flask, request, jsonify, send_file
 import yt_dlp
 import os
 import tempfile
-import threading
 import time
 
 app = Flask(__name__)
@@ -15,6 +14,9 @@ def get_yt_dlp_opts(mode, outtmpl):
         'quiet': True,
         'no_warnings': True,
         'outtmpl': outtmpl,
+        'add_header': [
+            'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
+        ],
     }
     if mode == 'audio':
         opts.update({
@@ -26,9 +28,9 @@ def get_yt_dlp_opts(mode, outtmpl):
             }],
         })
     else: # video
-        # Allow any available format to prevent "Requested format not available" errors
+        # Default to 360p but allow any if not available
         opts.update({
-            'format': 'best',
+            'format': 'best[height<=360]/best',
         })
     return opts
 
@@ -47,39 +49,44 @@ def download():
         
         outtmpl = os.path.join(download_dir, '%(title)s.%(ext)s')
         
-        # Start with simple options
-        opts = get_yt_dlp_opts(mode, outtmpl)
-        
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            try:
+        # Try with preferred quality first
+        try:
+            opts = get_yt_dlp_opts(mode, outtmpl)
+            with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=True)
-            except Exception as e:
-                # If it fails with cookies, try without as a last resort
-                # or just log the error
-                print(f"Download error: {str(e)}")
-                return jsonify({'error': str(e)}), 500
+                filename = ydl.prepare_filename(info)
+        except Exception:
+            # Absolute fallback for format errors
+            opts = get_yt_dlp_opts(mode, outtmpl)
+            opts['format'] = 'best'
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                filename = ydl.prepare_filename(info)
 
-            filename = ydl.prepare_filename(info)
-            if mode == 'audio':
-                filename = os.path.splitext(filename)[0] + '.mp3'
+        # Handle post-processed extensions for audio
+        if mode == 'audio':
+            base_path = os.path.splitext(filename)[0]
+            if os.path.exists(base_path + '.mp3'):
+                filename = base_path + '.mp3'
 
-            # Search for the file if prepare_filename is slightly off
-            if not os.path.exists(filename):
-                for f in os.listdir(download_dir):
-                    if not f.endswith('.part'):
-                        filename = os.path.join(download_dir, f)
-                        break
+        # Absolute file search fallback
+        if not os.path.exists(filename):
+            for f in os.listdir(download_dir):
+                if not f.endswith('.part'):
+                    filename = os.path.join(download_dir, f)
+                    break
 
-            if not os.path.exists(filename):
-                return jsonify({'error': f'File not found after download attempt in {download_dir}'}), 500
+        if not os.path.exists(filename):
+            return jsonify({'error': 'Download failed to produce a file'}), 500
 
-            return send_file(
-                filename,
-                as_attachment=True,
-                download_name=os.path.basename(filename)
-            )
+        return send_file(
+            filename,
+            as_attachment=True,
+            download_name=os.path.basename(filename)
+        )
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        error_msg = str(e).split('\n')[0]
+        return jsonify({'error': f"Download Error: {error_msg}"}), 500
 
 @app.route('/', methods=['GET'])
 def index():
@@ -88,10 +95,6 @@ def index():
         'endpoints': {
             'download_video': '/download?mode=video&url=<YOUTUBE_URL>',
             'download_audio': '/download?mode=audio&url=<YOUTUBE_URL>'
-        },
-        'defaults': {
-            'video_quality': '360p',
-            'audio_quality': 'lowest'
         }
     })
 
