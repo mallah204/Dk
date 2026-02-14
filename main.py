@@ -26,6 +26,7 @@ def get_yt_dlp_opts(mode, outtmpl):
         ],
         'nocheckcertificate': True,
         'format': audio_selector if mode == 'audio' else video_selector,
+        'ignoreerrors': True, # Crucial: don't stop on single format errors
     }
     
     if mode == 'audio':
@@ -66,25 +67,27 @@ def process_download(url, mode):
         info = None
         filename = None
         
-        # Try with selectors first
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
+        # We try to extract info and download
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            try:
+                # Attempt with the preferred format selector
                 info = ydl.extract_info(url, download=True)
+                if not info or '_type' in info and info['_type'] == 'playlist':
+                    raise Exception("Format selection failed or playlist returned")
                 filename = ydl.prepare_filename(info)
-        except Exception:
-            # Fallback to absolute simplest format if selectors failed
-            opts['format'] = 'best'
-            if mode == 'video' and 'postprocessors' in opts:
-                opts['postprocessors'] = []
-            
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                filename = ydl.prepare_filename(info)
+            except Exception as e:
+                # FALLBACK: Try with absolute 'best' format if the specific selector fails
+                print(f"Preferred format failed: {e}. Trying fallback 'best' format.")
+                opts['format'] = 'best'
+                # Re-initialize to clear any cached failure states
+                with yt_dlp.YoutubeDL(opts) as ydl_fallback:
+                    info = ydl_fallback.extract_info(url, download=True)
+                    filename = ydl_fallback.prepare_filename(info)
 
         if not info:
-             return jsonify({'error': 'Download failed to extract info'}), 500
+             return jsonify({'error': 'Download failed: Requested format and fallbacks are not available.'}), 500
 
-        # Handle post-processing extension changes
+        # Extension handling for post-processors
         if mode == 'audio':
             base, _ = os.path.splitext(filename)
             if os.path.exists(base + '.mp3'):
@@ -104,9 +107,9 @@ def process_download(url, mode):
             if files:
                 filename = os.path.join(download_dir, files[0])
             else:
-                return jsonify({'error': 'No file was produced by yt-dlp'}), 500
+                return jsonify({'error': 'Download completed but no file was found on disk.'}), 500
 
-        # Create a persistent copy because temp directories are often cleared
+        # Copy to a safer temp location before cleaning up the temp dir
         final_dest = os.path.join(tempfile.gettempdir(), os.path.basename(filename))
         shutil.copy2(filename, final_dest)
         shutil.rmtree(download_dir)
