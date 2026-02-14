@@ -1,136 +1,125 @@
 from flask import Flask, request, jsonify, send_file
 import yt_dlp
-import os
 import tempfile
-import shutil
+import os
 
 app = Flask(__name__)
 
-# Use absolute path for cookies if available
+# Base directory
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Optional cookies file
 COOKIES_FILE = os.path.join(BASE_DIR, 'cookies', 'youtube.txt')
 
-def get_yt_dlp_opts(mode, outtmpl):
-    video_selector = 'bestvideo[height<=360]+bestaudio/best[height<=360]/bestvideo+bestaudio/best'
-    audio_selector = 'bestaudio/best'
-    
+# FFmpeg binary path (important for Render)
+FFMPEG_PATH = os.path.join(BASE_DIR, 'bin', 'ffmpeg')
+
+
+def get_ydl_opts(mode, output_path):
+    # Safer formats (less "Requested format not available" error)
+    video_format = "best[height<=360]/best"
+    audio_format = "bestaudio/best"
+
     opts = {
-        'cookiefile': COOKIES_FILE if os.path.exists(COOKIES_FILE) else None,
+        'outtmpl': output_path,
         'quiet': True,
         'no_warnings': True,
-        'outtmpl': outtmpl,
-        'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
-        },
         'nocheckcertificate': True,
-        'format': audio_selector if mode == 'audio' else video_selector,
+        'format': audio_format if mode == "audio" else video_format,
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+        }
     }
-    
-    if mode == 'audio':
-        opts.update({
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '64',
-            }],
-        })
-    else:
-        opts.update({
-            'merge_output_format': 'mp4',
-        })
-        
+
+    # Add cookies only if exist
+    if os.path.exists(COOKIES_FILE):
+        opts['cookiefile'] = COOKIES_FILE
+
+    # Add ffmpeg path only if exist
+    if os.path.exists(FFMPEG_PATH):
+        opts['ffmpeg_location'] = FFMPEG_PATH
+
+    if mode == "video":
+        opts['merge_output_format'] = 'mp4'
+
+    if mode == "audio":
+        opts['postprocessors'] = [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '64',
+        }]
+
     return opts
 
-@app.route('/video', methods=['GET'])
-def download_video():
-    url = request.args.get('url')
-    if not url:
-        return jsonify({'error': 'URL is required'}), 400
-    return process_download(url, 'video')
 
-@app.route('/audio', methods=['GET'])
-def download_audio():
-    url = request.args.get('url')
-    if not url:
-        return jsonify({'error': 'URL is required'}), 400
-    return process_download(url, 'audio')
+def download_media(url, mode):
+    temp_dir = tempfile.mkdtemp()
+    output_template = os.path.join(temp_dir, "%(title)s.%(ext)s")
 
-def process_download(url, mode):
-    download_dir = tempfile.mkdtemp()
     try:
-        outtmpl = os.path.join(download_dir, '%(title)s.%(ext)s')
-        opts = get_yt_dlp_opts(mode, outtmpl)
-        
-        info = None
-        filename = None
-        
-        format_fallbacks = [
-            opts['format'],
-            'best',
-            'worst',
-        ]
-        
-        for fmt in format_fallbacks:
-            try:
-                opts['format'] = fmt
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(url, download=True)
-                    if info and not ('_type' in info and info['_type'] == 'playlist'):
-                        filename = ydl.prepare_filename(info)
-                        break
-            except Exception as e:
-                print(f"Format '{fmt}' failed: {e}")
-                continue
+        ydl_opts = get_ydl_opts(mode, output_template)
 
-        if not info:
-             return jsonify({'error': 'Download failed: Requested format and fallbacks are not available.'}), 500
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(info)
 
-        # Extension handling for post-processors
-        if mode == 'audio':
-            base, _ = os.path.splitext(filename)
-            if os.path.exists(base + '.mp3'):
-                filename = base + '.mp3'
-            else:
-                for f in os.listdir(download_dir):
-                    if f.endswith('.mp3'):
-                        filename = os.path.join(download_dir, f)
-                        break
-        elif mode == 'video':
-            base, _ = os.path.splitext(filename)
-            if os.path.exists(base + '.mp4'):
-                filename = base + '.mp4'
-        
+        # Fix filename after processing
+        if mode == "audio":
+            filename = os.path.splitext(filename)[0] + ".mp3"
+
+        if mode == "video":
+            filename = os.path.splitext(filename)[0] + ".mp4"
+
+        # Fallback if filename changed
         if not os.path.exists(filename):
-            files = [f for f in os.listdir(download_dir) if not f.endswith('.part')]
+            files = [f for f in os.listdir(temp_dir) if not f.endswith('.part')]
             if files:
-                filename = os.path.join(download_dir, files[0])
+                filename = os.path.join(temp_dir, files[0])
             else:
-                return jsonify({'error': 'Download completed but no file was found on disk.'}), 500
+                return None, "Download failed"
 
-        # Copy to a safer temp location before cleaning up the temp dir
-        final_dest = os.path.join(tempfile.gettempdir(), os.path.basename(filename))
-        shutil.copy2(filename, final_dest)
-        shutil.rmtree(download_dir)
+        return filename, None
 
-        return send_file(
-            final_dest,
-            as_attachment=True,
-            download_name=os.path.basename(filename)
-        )
     except Exception as e:
-        if os.path.exists(download_dir):
-            shutil.rmtree(download_dir)
-        return jsonify({'error': str(e)}), 500
+        return None, str(e)
 
-@app.route('/', methods=['GET'])
-def index():
+
+@app.route("/video")
+def video():
+    url = request.args.get("url")
+    if not url:
+        return jsonify({"error": "URL parameter missing"}), 400
+
+    file_path, error = download_media(url, "video")
+    if error:
+        return jsonify({"error": f"Download Error: {error}"}), 500
+
+    return send_file(file_path, as_attachment=True)
+
+
+@app.route("/audio")
+def audio():
+    url = request.args.get("url")
+    if not url:
+        return jsonify({"error": "URL parameter missing"}), 400
+
+    file_path, error = download_media(url, "audio")
+    if error:
+        return jsonify({"error": f"Download Error: {error}"}), 500
+
+    return send_file(file_path, as_attachment=True)
+
+
+@app.route("/")
+def home():
     return jsonify({
-        'status': 'online',
-        'endpoints': {
-            'video': '/video?url=<url>',
-            'audio': '/audio?url=<url>'
+        "status": "online",
+        "endpoints": {
+            "video": "/video?url=VIDEO_URL",
+            "audio": "/audio?url=VIDEO_URL"
         }
     })
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
