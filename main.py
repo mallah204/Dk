@@ -26,41 +26,51 @@ def get_yt_dlp_opts(mode, outtmpl):
             }],
         })
     else: # video
+        # Simplified format string to be more robust
         opts.update({
-            'format': 'bestvideo[height<=360]+bestaudio/best[height<=360]/best',
+            'format': 'best[height<=360]/best',
         })
     return opts
 
 @app.route('/download', methods=['GET'])
 def download():
     url = request.args.get('url')
-    mode = request.args.get('mode', 'video') # 'video' or 'audio'
+    mode = request.args.get('mode', 'video')
     
     if not url:
         return jsonify({'error': 'URL is required'}), 400
 
     try:
-        # Create a persistent directory for the download session
         session_id = str(time.time()).replace('.', '')
         download_dir = os.path.join(tempfile.gettempdir(), f'ytdl_{session_id}')
         os.makedirs(download_dir, exist_ok=True)
         
         outtmpl = os.path.join(download_dir, '%(title)s.%(ext)s')
-        opts = get_yt_dlp_opts(mode, outtmpl)
         
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
+        # Use a more lenient approach for extraction
+        with yt_dlp.YoutubeDL(get_yt_dlp_opts(mode, outtmpl)) as ydl:
+            # First, try to just get info without downloading to verify
+            try:
+                info = ydl.extract_info(url, download=True)
+            except yt_dlp.utils.DownloadError:
+                # Fallback: remove strict format constraints if it fails
+                opts = get_yt_dlp_opts(mode, outtmpl)
+                opts['format'] = 'best'
+                with yt_dlp.YoutubeDL(opts) as ydl_fallback:
+                    info = ydl_fallback.extract_info(url, download=True)
+
             filename = ydl.prepare_filename(info)
-            
-            # If audio, the extension might have changed to mp3 by postprocessor
             if mode == 'audio':
                 filename = os.path.splitext(filename)[0] + '.mp3'
 
+            # Double check if file exists, if not look in directory
             if not os.path.exists(filename):
-                # Fallback check for common patterns if prepare_filename doesn't match exactly
-                files = os.listdir(download_dir)
+                files = [f for f in os.listdir(download_dir) if not f.endswith('.part')]
                 if files:
                     filename = os.path.join(download_dir, files[0])
+
+            if not os.path.exists(filename):
+                return jsonify({'error': 'File not found after download'}), 500
 
             return send_file(
                 filename,
