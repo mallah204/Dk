@@ -2,7 +2,6 @@ from flask import Flask, request, jsonify, send_file
 import yt_dlp
 import os
 import tempfile
-import time
 import shutil
 
 app = Flask(__name__)
@@ -20,8 +19,11 @@ def get_yt_dlp_opts(mode, outtmpl):
         'add_header': [
             'User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
         ],
+        'nocheckcertificate': True,
     }
+    
     if mode == 'audio':
+        # Broadest audio format selection
         opts.update({
             'format': 'bestaudio/best',
             'postprocessors': [{
@@ -30,12 +32,13 @@ def get_yt_dlp_opts(mode, outtmpl):
                 'preferredquality': '192',
             }],
         })
-    else: # video
+    else:
+        # Broadest video format selection: try combined best, then fallback
         opts.update({
-            # Resilient format selection
             'format': 'bestvideo+bestaudio/best',
             'merge_output_format': 'mp4',
         })
+        
     return opts
 
 @app.route('/download', methods=['GET'])
@@ -53,13 +56,16 @@ def download():
         opts = get_yt_dlp_opts(mode, outtmpl)
         
         with yt_dlp.YoutubeDL(opts) as ydl:
-            # Re-fetch info and download with broad error handling
             try:
+                # Main attempt with preferred quality
                 info = ydl.extract_info(url, download=True)
             except Exception as e:
-                # Fallback to absolute best if combined fails
-                if mode == 'video':
+                # Fallback attempt with absolutely any available quality
+                if "Requested format is not available" in str(e):
                     opts['format'] = 'best'
+                    # If video, don't force merge to mp4 on fallback
+                    if 'merge_output_format' in opts:
+                        del opts['merge_output_format']
                     with yt_dlp.YoutubeDL(opts) as ydl_fallback:
                         info = ydl_fallback.extract_info(url, download=True)
                 else:
@@ -67,31 +73,33 @@ def download():
             
             filename = ydl.prepare_filename(info)
             
-            # Handle extension changes
+            # Extension cleanup
             if mode == 'audio':
                 base, _ = os.path.splitext(filename)
                 if os.path.exists(base + '.mp3'):
                     filename = base + '.mp3'
             elif mode == 'video':
-                # If we merged to mp4, ensure filename reflects that
                 base, _ = os.path.splitext(filename)
                 if os.path.exists(base + '.mp4'):
                     filename = base + '.mp4'
 
         if not os.path.exists(filename):
+            # Final scan of directory for any downloaded file
             files = [f for f in os.listdir(download_dir) if not f.endswith('.part')]
             if files:
                 filename = os.path.join(download_dir, files[0])
             else:
-                return jsonify({'error': 'File not found after download'}), 500
+                return jsonify({'error': 'Download failed to produce a file'}), 500
 
+        # Note: We keep the file in temp for serving. 
+        # For production, consider background cleanup.
         return send_file(
             filename,
             as_attachment=True,
             download_name=os.path.basename(filename)
         )
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': f"Download Error: {str(e)}"}), 500
 
 @app.route('/', methods=['GET'])
 def index():
